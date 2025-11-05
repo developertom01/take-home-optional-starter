@@ -50,30 +50,18 @@ export interface ClinicianAvailability {
  */
 export function optimizeSlots(dates: Date[], durationMinutes: number): Date[] {
   if (dates.length === 0) return [];
+  const intervals = dates
+    .map(d => ({ start: d, end: new Date(d.getTime() + durationMinutes * 60_000) }))
+    .sort((a, b) => a.end.getTime() - b.end.getTime());
 
-  // Sort dates chronologically
-  const sorted = [...dates].sort((a, b) => a.getTime() - b.getTime());
-  
-  // Convert to intervals with start and end times
-  const intervals = sorted.map(date => ({
-    start: date,
-    end: new Date(date.getTime() + durationMinutes * 60 * 1000)
-  }));
-
-  // Greedy algorithm: select earliest ending intervals that don't overlap
-  const selected: Date[] = [sorted[0]];
-  let lastEndTime = intervals[0].end.getTime();
-
-  for (let i = 1; i < intervals.length; i++) {
-    const currentStart = intervals[i].start.getTime();
-    
-    // If current slot starts at or after the last selected slot ends, include it
-    if (currentStart >= lastEndTime) {
-      selected.push(sorted[i]);
-      lastEndTime = intervals[i].end.getTime();
+  const selected: Date[] = [];
+  let lastEnd = -Infinity;
+  for (const itv of intervals) {
+    if (itv.start.getTime() >= lastEnd) {
+      selected.push(itv.start);
+      lastEnd = itv.end.getTime();
     }
   }
-
   return selected;
 }
 

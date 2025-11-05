@@ -4,11 +4,19 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "start": "npx ts-node src/index.ts",
     "dev": "npx ts-node src/index.ts",
+    "dev:watch": "npx ts-node-dev --respawn src/index.ts",
     "compile": "npx tsc",
+    "build": "npx tsc",
     "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
     "lint": "eslint .",
-    "type-check": "tsc --noEmit"
+    "lint:fix": "eslint . --fix",
+    "type-check": "tsc --noEmit",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "format:check": "prettier --check \"src/**/*.ts\""
   },
   "keywords": [],
   "author": "",
