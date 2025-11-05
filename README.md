@@ -1,6 +1,10 @@
 # Prosper Health Engineering Take Home
 2025
 
+## Thomas Sarpong Solution
+
+📖 **[View Solution Documentation](./docs/README.md)**
+
 # Scenario
 
 We want new patients to schedule their appointments online. Given a patient who comes in wanting our services (therapy and/or an assessment), which times are available for them to book? And with which clinicians?
