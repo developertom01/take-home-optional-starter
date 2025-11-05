@@ -47,7 +47,6 @@ This document outlines how to scale the current in-memory implementation to a pr
 │      Business Logic (TypeScript)            │
 │  - Prisma ORM                               │
 │  - Redis for caching                        │
-│  - Bull for job queues                      │
 └──────────────────┬──────────────────────────┘
                    │
         ┌──────────┴──────────┐
@@ -73,10 +72,17 @@ const allClinicians = await prisma.clinician.findMany({
   include: { availableSlots: true, appointments: true }
 });
 // Filter in application code
+// ❌ Full table scan on AvailableSlot and Appointment
+// ❌ Transfers unnecessary data over network
+// ❌ No date range filtering = performance issues with old data
 ```
 
-**Optimized**: Use Prisma's filtering
+**Optimized**: Use Prisma's filtering with date ranges
 ```typescript
+// Define search window (e.g., next 30 days)
+const searchStartDate = new Date();
+const searchEndDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+
 const eligibleClinicians = await prisma.clinician.findMany({
   where: {
     clinicianType: 'PSYCHOLOGIST',
@@ -90,8 +96,8 @@ const eligibleClinicians = await prisma.clinician.findMany({
       some: {
         length: 90,
         date: {
-          gte: new Date(),  // Only future slots
-          lte: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)  // Next 30 days
+          gte: searchStartDate,  // Only future slots
+          lte: searchEndDate     // Within search window
         }
       }
     }
@@ -101,8 +107,8 @@ const eligibleClinicians = await prisma.clinician.findMany({
       where: {
         length: 90,
         date: {
-          gte: new Date(),
-          lte: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
+          gte: searchStartDate,
+          lte: searchEndDate  // CRITICAL: Prevents full table scan
         }
       },
       orderBy: { date: 'asc' }
@@ -111,8 +117,9 @@ const eligibleClinicians = await prisma.clinician.findMany({
       where: {
         status: { in: ['UPCOMING', 'OCCURRED', 'LATE_CANCELLATION'] },
         scheduledFor: {
-          gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),  // Last 7 days
-          lte: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)  // Next 30 days
+          // Include recent past for accurate capacity calculation
+          gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+          lte: searchEndDate
         }
       }
     }
@@ -122,10 +129,18 @@ const eligibleClinicians = await prisma.clinician.findMany({
 ```
 
 **Benefits**:
-- ✅ Only fetches relevant data
-- ✅ Database does the filtering (faster)
-- ✅ Reduces network transfer
+- ✅ Only fetches relevant data within date range
+- ✅ Database does the filtering (uses indexes)
+- ✅ Reduces network transfer (no old/distant data)
 - ✅ Supports pagination out of the box
+- ✅ **Prevents full table scans** with proper indexes on date columns
+- ✅ Scales as historical data grows
+
+**Why Date Range is Critical**:
+- Without date filtering, queries scan **all** slots/appointments (millions over time)
+- With date range: Only scans 30 days of data (~thousands of rows)
+- **Performance impact**: 100x+ faster queries as data accumulates
+- **Index usage**: Database can use B-tree indexes on date columns efficiently
 
 ---
 
@@ -218,7 +233,7 @@ const availableClinicians = await prisma.$queryRaw`
       AND ${patient.insurance}::text = ANY(c.insurances)
   ),
   
-  -- Get 90-min slots
+  -- Get 90-min slots within date range
   assessment_slots AS (
     SELECT s.id, s."clinicianId", s.date,
            DATE_TRUNC('day', s.date) AS day,
@@ -226,11 +241,12 @@ const availableClinicians = await prisma.$queryRaw`
     FROM "AvailableSlot" s
     INNER JOIN eligible_clinicians ec ON s."clinicianId" = ec.id
     WHERE s.length = 90
+      -- CRITICAL: Date range prevents full table scan
       AND s.date >= NOW()
       AND s.date <= NOW() + INTERVAL '30 days'
   ),
   
-  -- Count existing appointments by day
+  -- Count existing appointments by day (within same date range)
   appointments_per_day AS (
     SELECT a."clinicianId",
            DATE_TRUNC('day', a."scheduledFor") AS day,
@@ -238,12 +254,13 @@ const availableClinicians = await prisma.$queryRaw`
     FROM "Appointment" a
     INNER JOIN eligible_clinicians ec ON a."clinicianId" = ec.id
     WHERE a.status IN ('UPCOMING', 'OCCURRED', 'LATE_CANCELLATION')
+      -- CRITICAL: Same date range as slots prevents full table scan
       AND a."scheduledFor" >= NOW()
       AND a."scheduledFor" <= NOW() + INTERVAL '30 days'
     GROUP BY a."clinicianId", DATE_TRUNC('day', a."scheduledFor")
   ),
   
-  -- Count existing appointments by week
+  -- Count existing appointments by week (within same date range)
   appointments_per_week AS (
     SELECT a."clinicianId",
            DATE_TRUNC('week', a."scheduledFor") AS week,
@@ -251,6 +268,7 @@ const availableClinicians = await prisma.$queryRaw`
     FROM "Appointment" a
     INNER JOIN eligible_clinicians ec ON a."clinicianId" = ec.id
     WHERE a.status IN ('UPCOMING', 'OCCURRED', 'LATE_CANCELLATION')
+      -- CRITICAL: Same date range as slots prevents full table scan
       AND a."scheduledFor" >= NOW()
       AND a."scheduledFor" <= NOW() + INTERVAL '30 days'
     GROUP BY a."clinicianId", DATE_TRUNC('week', a."scheduledFor")
@@ -350,57 +368,7 @@ model Appointment {
 
 ---
 
-## Caching Strategy
-
-### 1. Redis Caching Layer
-
-```typescript
-import { Redis } from 'ioredis';
-
-const redis = new Redis(process.env.REDIS_URL);
-
-async function findAssessmentSlotsWithCache(
-  patient: Patient,
-  page: number = 1
-): Promise<ClinicianAvailability[]> {
-  // Cache key based on patient criteria
-  const cacheKey = `slots:assessment:${patient.state}:${patient.insurance}:page:${page}`;
-  
-  // Try cache first
-  const cached = await redis.get(cacheKey);
-  if (cached) {
-    return JSON.parse(cached);
-  }
-  
-  // Cache miss - compute results
-  const results = await findAssessmentSlots(patient, page);
-  
-  // Cache for 5 minutes (slots don't change frequently)
-  await redis.setex(cacheKey, 300, JSON.stringify(results));
-  
-  return results;
-}
-
-// Invalidate cache when slots change
-async function onSlotBooked(clinicianId: string) {
-  // Invalidate all relevant cache keys
-  const pattern = `slots:*`;
-  const keys = await redis.keys(pattern);
-  if (keys.length > 0) {
-    await redis.del(...keys);
-  }
-}
-```
-
-**Cache Strategy**:
-- ✅ Cache query results for 5 minutes
-- ✅ Invalidate on bookings/cancellations
-- ✅ Separate cache per state/insurance combination
-- ✅ Use Redis clusters for high availability
-
----
-
-### 2. Materialized Views
+## Materialized Views
 
 For frequently accessed aggregations:
 
@@ -568,24 +536,155 @@ async function bookAssessmentWithLock(
 ### 1. Query Performance Monitoring
 
 ```typescript
-// Prisma middleware for logging
-prisma.$use(async (params, next) => {
-  const before = Date.now();
-  const result = await next(params);
-  const after = Date.now();
-  
-  console.log(`Query ${params.model}.${params.action} took ${after - before}ms`);
-  
-  // Alert on slow queries
-  if (after - before > 1000) {
-    console.warn(`SLOW QUERY: ${params.model}.${params.action}`);
+import pino from 'pino';
+import { Prisma } from '@prisma/client';
+
+const logger = pino({
+  level: process.env.LOG_LEVEL || 'info',
+  formatters: {
+    level: (label) => {
+      return { level: label };
+    }
   }
-  
-  return result;
+});
+
+// Extend Prisma Client with query logging
+const prisma = new PrismaClient().$extends({
+  query: {
+    $allModels: {
+      async $allOperations({ operation, model, args, query }) {
+        const startTime = Date.now();
+        const queryId = crypto.randomUUID();
+        
+        // Log query start
+        logger.info({
+          event: 'database.query.start',
+          queryId,
+          model,
+          operation,
+          timestamp: new Date().toISOString()
+        });
+        
+        try {
+          const result = await query(args);
+          const duration = Date.now() - startTime;
+          
+          // Log successful query
+          logger.info({
+            event: 'database.query.success',
+            queryId,
+            model,
+            operation,
+            durationMs: duration,
+            timestamp: new Date().toISOString()
+          });
+          
+          // Alert on slow queries
+          if (duration > 1000) {
+            logger.warn({
+              event: 'database.query.slow',
+              queryId,
+              model,
+              operation,
+              durationMs: duration,
+              threshold: 1000,
+              timestamp: new Date().toISOString()
+            });
+          }
+          
+          return result;
+        } catch (error) {
+          const duration = Date.now() - startTime;
+          
+          // Log query error
+          logger.error({
+            event: 'database.query.error',
+            queryId,
+            model,
+            operation,
+            durationMs: duration,
+            error: {
+              message: error.message,
+              name: error.name,
+              code: error.code
+            },
+            timestamp: new Date().toISOString()
+          });
+          
+          throw error;
+        }
+      }
+    }
+  }
 });
 ```
 
-### 2. Key Metrics to Track
+### 2. Application-Level Logging
+
+```typescript
+// Log booking attempts
+async function bookAssessmentSlots(data: BookingData) {
+  const bookingId = crypto.randomUUID();
+  
+  logger.info({
+    event: 'booking.attempt',
+    bookingId,
+    patientId: data.patientId,
+    clinicianId: data.clinicianId,
+    slotDates: data.slotDates,
+    timestamp: new Date().toISOString()
+  });
+  
+  try {
+    const result = await bookWithTransaction(data);
+    
+    logger.info({
+      event: 'booking.success',
+      bookingId,
+      patientId: data.patientId,
+      clinicianId: data.clinicianId,
+      appointmentIds: result.appointmentIds,
+      timestamp: new Date().toISOString()
+    });
+    
+    return result;
+  } catch (error) {
+    logger.error({
+      event: 'booking.failure',
+      bookingId,
+      patientId: data.patientId,
+      clinicianId: data.clinicianId,
+      error: {
+        message: error.message,
+        name: error.name,
+        code: error.code
+      },
+      timestamp: new Date().toISOString()
+    });
+    
+    throw error;
+  }
+}
+
+// Log capacity checks
+function checkCapacity(clinician: Clinician, dates: Date[]) {
+  const hasCapacity = canAccommodateAppointments(clinician, dates);
+  
+  logger.debug({
+    event: 'capacity.check',
+    clinicianId: clinician.id,
+    requestedDates: dates.map(d => d.toISOString()),
+    hasCapacity,
+    currentDailyAppointments: getAppointmentsOnDay(clinician, dates[0]).length,
+    maxDailyAppointments: clinician.maxDailyAppointments,
+    timestamp: new Date().toISOString()
+  });
+  
+  return hasCapacity;
+}
+```
+
+### 3. Key Metrics to Track
 
 - Query response time (p50, p95, p99)
 - Cache hit rate
@@ -612,41 +711,12 @@ prisma.$use(async (params, next) => {
 - ✅ Set up health checks
 - ✅ Enable distributed tracing
 
-### Caching
-- ✅ Deploy Redis cluster
-- ✅ Configure eviction policies
-- ✅ Set up cache warming on deploy
-- ✅ Monitor cache hit rates
-
 ### Monitoring
-- ✅ Set up Datadog/New Relic
+- ✅ Set up Datadog
 - ✅ Configure alerts for errors
 - ✅ Track business metrics
-- ✅ Set up log aggregation
+- ✅ Set up log aggregation in splunk or datadog
 
----
-
-## Cost Optimization
-
-### 1. Database Costs
-- Use read replicas for queries
-- Archive old appointments (>6 months)
-- Partition large tables by date
-- Use appropriate instance sizes
-
-### 2. Caching Costs
-- Cache only frequently accessed data
-- Use appropriate TTLs
-- Monitor cache memory usage
-- Consider CDN for static data
-
-### 3. Compute Costs
-- Auto-scale based on traffic
-- Use spot instances for background jobs
-- Optimize cold starts (serverless)
-- Profile and optimize hot paths
-
----
 
 ## Summary
 

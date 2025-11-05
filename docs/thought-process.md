@@ -176,7 +176,6 @@
 **Rationale**:
 - Mathematically proven optimal for interval scheduling
 - O(n log n) complexity (sorting dominates)
-- Simple to implement and understand
 
 **Alternative considered**: Dynamic programming
 - **Rejected**: Same result, more complex, same time complexity
