@@ -368,6 +368,70 @@ model Appointment {
 
 ---
 
+## Caching Strategy
+
+### Why Cache?
+
+**Problem**: Slot availability queries are expensive (joins, capacity calculations, filtering) and read-heavy (users browsing >> users booking).
+
+**Solution**: Cache query results with Redis to reduce database load and improve response times.
+
+### Cache Invalidation Challenge
+
+Caching introduces staleness: cached data may not reflect recent bookings/cancellations. Cache invalidation solves this by removing or updating stale data when the source changes.
+
+**Trade-off**: Fresh data vs. performance
+- **No cache**: Always fresh, but slow (100ms+ queries)
+- **Cache without invalidation**: Fast but stale (users see booked slots)
+- **Cache with invalidation**: Fast AND fresh (best of both worlds)
+
+### Recommended Approach: Time-To-Live (TTL)
+
+For this scheduling system, use **short TTL** (3-5 minutes) instead of complex invalidation:
+
+```typescript
+import { Redis } from 'ioredis';
+
+const redis = new Redis(process.env.REDIS_URL);
+
+async function findAssessmentSlotsWithCache(
+  patient: Patient,
+  page: number = 1
+): Promise<ClinicianAvailability[]> {
+  const cacheKey = `slots:assessment:${patient.state}:${patient.insurance}:page:${page}`;
+  
+  // Try cache first
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+  
+  // Cache miss - query database
+  const results = await findAssessmentSlots(patient, page);
+  
+  // Cache for 3 minutes
+  await redis.setex(cacheKey, 180, JSON.stringify(results));
+  
+  return results;
+}
+```
+
+**Why TTL works here**:
+- ✅ Slots rarely change (updated weekly/monthly by admins)
+- ✅ 3-5 minute staleness is acceptable (user browsing takes time)
+- ✅ Simple: No complex invalidation logic
+- ✅ Self-healing: Stale entries expire automatically
+- ✅ Reduces database load by ~80% (multiple users browsing simultaneously)
+
+**When to use event-driven invalidation instead**:
+- Real-time inventory (stock trading, concert tickets)
+- High booking frequency (>100 bookings/minute)
+- Zero-tolerance for stale data
+
+For this healthcare scheduling use case, TTL is the right trade-off between complexity and performance.
+
+---
+
 ## Materialized Views
 
 For frequently accessed aggregations:
