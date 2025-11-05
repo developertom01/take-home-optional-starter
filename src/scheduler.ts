@@ -248,7 +248,7 @@ export function findAssessmentSlots(
     // Get 90-minute slots only (psychologist assessment slots)
     const assessmentSlots = clinician.availableSlots
       .filter(slot => slot.length === 90)
-      .map(slot => slot.date)
+      .map(slot =>  new Date(slot.date))
       .sort((a, b) => a.getTime() - b.getTime());
 
     if (assessmentSlots.length < 2) {
